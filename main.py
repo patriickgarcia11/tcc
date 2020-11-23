@@ -1,102 +1,131 @@
+import pandas
+import gzip
+import datetime
 import requests
+import schedule
 import time
+from io import BytesIO
+from dateutil import parser
 from pymongo import MongoClient
-
-# Pegando dados totais de SP (historico de casos em SP):
-# https://brasil.io/api/dataset/covid19/caso/data/?page=1&state=SP
-#
-# Pegando dados atualizados de SP:
-# https://brasil.io/covid19/cities/cases/?state=SP
-# Pegando dados acumulados de SP
-
-# Inicializando variáveis
-url = f'https://brasil.io/covid19/cities/cases/?state=SP'
-lista_dados = []
+from statsmodels.tsa.arima_model import ARIMA
 
 
-def connect_to_mongo():
+# method to return the mongodb connection
+def get_mongodb_database():
     try:
         client = MongoClient(
-            "mongodb+srv://tcc:tcc_covid_19@cluster0.pmkga.mongodb.net/DB_COVID?retryWrites=true&w=majority&ssl=true"
-            "&ssl_cert_reqs=CERT_NONE")
+            "mongodb+srv://tcc:tcc_covid_19@cluster0.pmkga.mongodb.net/DB_COVID?retryWrites=true&w=majority&ssl=true&ssl_cert_reqs=CERT_NONE")
         print("Sucesso na conexão com o Mongo DB")
-        db = client.DB_COVID
-        return db.DB_COVID
     except:
         print("Erro na conexão com o Mongo DB")
-        return None
+
+    db = client.DB_COVID
+    return db
 
 
-def get_covid_data(base_url):
-    # Request na api, timeout de 15 segundos
-    resposta = requests.get(base_url, timeout=15)
+# method to get, filter and return the dataframe
+def get_and_filter_data():
+    url = "https://data.brasil.io/dataset/covid19/caso_full.csv.gz"
 
-    if resposta.ok:
-        return resposta.json()
-    else:
-        return None
+    response = requests.get(url)
+    bytes_io = BytesIO(response.content)
+    with gzip.open(bytes_io, 'rt') as read_file:
+        df = pandas.read_csv(read_file)
+
+    df = df.loc[df['state'] == 'SP']
+    df = df.loc[df['city'] == 'São Paulo']
+    df = df.dropna()
+    del df['place_type']
+    del df['epidemiological_week']
+    del df['is_repeated']
+    del df['last_available_confirmed_per_100k_inhabitants']
+    del df['last_available_death_rate']
+    del df['estimated_population']
+    del df['is_last']
+    del df['last_available_deaths']
+    del df['last_available_confirmed']
+    del df['last_available_date']
+    del df['order_for_place']
+    del df['estimated_population_2019']
+    del df['city_ibge_code']
+    return df
 
 
-collection = connect_to_mongo()
-pagina = get_covid_data(url)
+# method to insert the historic data to the collection
+def insert_historic_data(df_filtered, collection):
+    for index, row in df_filtered.iterrows():
+        data = datetime.strptime(row['date'].replace('-', '/'), '%Y/%m/%d')
+        data = data.strftime('%d/%m/%Y')
+        data = parser.parse(data)
+
+        post_data = {
+            'estado': row['state'],
+            'cidade': row['city'],
+            'data': data,
+            'casos': row['new_confirmed'],
+            'mortes': row['new_deaths']
+        }
+        result = collection.insert_one(post_data)
+        print('Item inserido com sucesso na coleção: {0}'.format(result.inserted_id))
 
 
-def insert_to_covid_collection(estado, cidade, data, confirmados, mortes):
-    # Montando JSON a ser inserido
-    post_data = {
-        'estado': estado,
-        'cidade': cidade,
-        'data': data,
-        'casos_confirmados': confirmados,
-        'mortes': mortes
-    }
-    # Inserindo o JSON na coleção
-    result = collection.insert_one(post_data)
-    print('Item inserido com sucesso na coleção: {0}'.format(result.inserted_id))
+# method to return the arima forecasts results
+def apply_arima(index):
+    model = ARIMA(index, order=(2, 1, 2))
+    model_fit = model.fit(disp=0)
+    fc, se, conf = model_fit.forecast(7, alpha=0.05)
+    print(model_fit.summary())
+    print(model_fit)
+    print(f'Previsão dos próximos 7 dias: {fc}')
+    return fc
 
 
-while True:
-    dados = pagina['results']
+# method to insert the forecasts to the collection
+def insert_forecasts(deaths_forecast, cases_forecast, df_filtered, collection):
+    last_date = df_filtered.date.max()
+    last_date = datetime.datetime.strptime(last_date.replace('-', '/'), '%Y/%m/%d')
+    last_date = last_date.strftime('%d/%m/%Y')
+    last_date = parser.parse(last_date)
+    print(f'Ultima data: {last_date}')
 
-    for resultado in dados:
-        estado = resultado["state"]
-        cidade = resultado["city"]
-        data = resultado["date"]
-        confirmados = resultado["confirmed"]
-        mortes = resultado["deaths"]
+    days = 0
+    for deaths, cases in zip(deaths_forecast, cases_forecast):
+        days += 1
+        prevision_date = last_date + datetime.timedelta(days=days)
 
-        print(f'Estado: {estado}')
-        print(f'Cidade: {cidade}')
-        print(f'Data de atualização: {data}')
-        print(f'Confirmados: {confirmados}')
-        print(f'Mortes: {mortes}\n')
+        post_data = {
+            'estado': 'SP',
+            'cidade': 'São Paulo',
+            'data': prevision_date,
+            'casos': int(cases),
+            'mortes': int(deaths)
+        }
+        result = collection.insert_one(post_data)
+        print('Item inserido com sucesso na coleção: {0}'.format(result.inserted_id))
 
-        lista_dados.append(resultado)
 
-        # Chamando método para inserir dados
-        insert_to_covid_collection(estado, cidade, data, confirmados, mortes)
+# method to run all the script job
+def run_job():
+    # get mongo db database by connection
+    mongo_database = get_mongodb_database()
+    # get historic collection to insert data
+    historic_collection = mongo_database.covid_historicos
+    # get filtered data frame
+    df_filtered = get_and_filter_data()
+    # insert historic data with the filtered data frame
+    insert_historic_data(df_filtered, historic_collection)
+    # get deaths forecast to the next 7 days
+    deaths_forecast = apply_arima(df_filtered.new_deaths)
+    # get cases forecast to the next 7 days
+    cases_forecast = apply_arima(df_filtered.new_confirmed)
+    # get forecast collection to insert data
+    forecast_collection = mongo_database.covid_historicos
+    # insert forecasts data with the filtered data frame
+    insert_forecasts(deaths_forecast, cases_forecast, df_filtered, forecast_collection)
 
-    if pagina['next'] is not None:
-        print(f'Aguarde 10 segundos... {pagina["next"]}')
-        time.sleep(10)
-        resposta = requests.get(pagina['next'])
-        if resposta.ok:
-            pagina = resposta.json()
-        else:
-            print(f'Mais 10 segundos... {pagina["next"]}')
-            time.sleep(10)
-            resposta = requests.get(pagina['next'])
-            if resposta.ok:
-                pagina = resposta.json()
-    else:
-        print('A lista acabou')
-        break
 
-print(f'A lista acabou e os dados finais são {lista_dados}')
-print(f'A lista acabou e tamanho da lista é de {len(lista_dados)} itens')
+schedule.every().day.at("23:00").do(run_job)
 
-# Plotando dados com valores
-# x = lista_data
-# y = lista_mortes
-# plot.bar(x, y)
-# plot.show()
+while 1:
+    schedule.run_pending()
+    time.sleep(1)
