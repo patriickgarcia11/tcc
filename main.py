@@ -87,8 +87,9 @@ def get_and_filter_data():
 # method to insert the daily data to the collection
 def insert_daily_data(df_filtered, mongo_database):
     collection = mongo_database.covid_diarios
+
     for index, row in df_filtered.iterrows():
-        data = datetime.strptime(row['date'].replace('-', '/'), '%Y/%m/%d')
+        data = datetime.datetime.strptime(row['date'].replace('-', '/'), '%Y/%m/%d')
         data = data.strftime('%d/%m/%Y')
         data = parser.parse(data)
 
@@ -149,7 +150,7 @@ def run_routine():
     # get filtered data frame
     df_filtered = get_and_filter_data()
 
-    # insert historic data with the filtered data frame
+    # insert daily data with the filtered data frame
     insert_daily_data(df_filtered, mongo_database)
 
     # insert cumulative data with the filtered data frame
